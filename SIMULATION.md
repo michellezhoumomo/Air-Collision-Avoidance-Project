@@ -177,7 +177,7 @@ step(action)
 | DT (sim timestep) | 5 seconds |
 | ACTION_FREQUENCY | 10 steps |
 | Sim time per agent decision | 50 seconds |
-| Spawn distance from FAF | 30–50 NM |
+| Spawn distance from FAF | 30–50 km (16–27 NM) |
 | Approach speed | ~180 kt (~333 km/h) |
 | Approx time to FAF | 10–17 min sim time |
 | Approx agent steps per episode | 12–20 |
@@ -212,6 +212,13 @@ bs.traf.cre(f'INT{i}', actype='A320',
 
 At each `bs.sim.step()` call, state is captured into a list of dicts. After the
 episode, this converts to DataFrames for pysda.
+
+The PPO helpers also expose `env.decision_trace`. It contains one frame per
+agent decision (the completed `env.step(action)`), including aircraft
+latitude/longitude, heading, speed, action, reward, cumulative reward, and
+minimum separation. Use this trace for policy comparisons and Plotly playback;
+do not use the per-tick `trajectory` list when the desired animation is one
+frame per action.
 
 ### Phase 1 (2D) — birdseye only
 

@@ -34,3 +34,6 @@ logs/
 runs/
 models/
 *.zip
+mlflow.db
+mlflow.db-*
+mlruns/

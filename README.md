@@ -18,6 +18,11 @@ Two algorithms are explored across two phases:
 The narrative across phases: use Phase 1 to compare algorithms on equal footing,
 pick the better performer, then extend it to 3D in Phase 2.
 
+PPO Phase 1 runs write a complete local research bundle under `runs/ppo_phase1/`:
+the model, CSV/JSON metrics, a reference-style PNG comparison, and a self-contained
+Plotly HTML animation. The training script logs the same bundle to local SQLite
+MLflow by default; see [`docs/PPO_WORKFLOW.md`](docs/PPO_WORKFLOW.md) for commands.
+
 ---
 
 ## Key Definitions
@@ -211,7 +216,7 @@ step(action)
 ```
 
 Time per episode (approximate):
-- Spawn distance: 30–50 NM from FAF
+- Spawn distance: 30–50 km (16–27 NM) from FAF
 - Speed: ~180 kt
 - Time to FAF: ~10–17 min sim time
 - At 50s per decision: ~12–20 agent steps per episode
@@ -237,13 +242,17 @@ Time per episode (approximate):
 Project/
 ├── README.md               # This file
 ├── SIMULATION.md           # Detailed simulation design and BlueSky reference
-├── envs/
-│   ├── approach_cr_2d.py   # Phase 1 environment (discrete actions for DQN)
-│   └── approach_cr_3d.py   # Phase 2 environment (continuous actions for PPO)
-├── train_dqn.py            # Phase 1 training — DQN (discrete)
-├── train_ppo.py            # Phase 1 + 2 training — PPO (continuous)
-└── visualize.py            # Trajectory logging + pysda plotting
+├── pyproject.toml          # UV project and editable package configuration
+├── src/air_collision_avoidance/
+│   ├── envs/approach_cr_2d.py  # Phase 1 BlueSky environment
+│   ├── ppo_utils.py            # Shared training, evaluation, and plotting
+│   └── ppo_*.py                # Installed PPO CLI entry points
+├── playground/              # Exploratory and presentation notebooks
+└── docs/PPO_WORKFLOW.md     # Reproducible PPO commands and artifacts
 ```
+
+Phase 2 remains a planned extension; the current packaged environment is the
+Phase 1 2D BlueSky environment.
 
 ---
 
