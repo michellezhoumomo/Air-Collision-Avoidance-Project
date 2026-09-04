@@ -1,0 +1,47 @@
+[project]
+name = "air-collision-avoidance"
+version = "0.1.0"
+description = "Reinforcement learning experiments for aircraft approach conflict resolution"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "gymnasium==1.3.0",
+    "stable_baselines3==2.9.0",
+    "torch==2.13.0",
+    "bluesky-simulator==1.1.1",
+    "bluesky-gym==0.2.0",
+    "bluesky-navdata==1.0.0",
+    "openap==2.6.0",
+    "msgpack==1.2.1",
+    "pygame==2.6.1",
+    "numpy==2.4.3",
+    "matplotlib==3.11.0",
+    "pandas==2.2.3",
+    "jupyter==1.1.1",
+    "ipywidgets==8.1.8",
+    "plotly>=6.0,<7",
+    "mlflow>=3.0,<4",
+]
+
+[project.scripts]
+ppo-env-check = "air_collision_avoidance.ppo_env_check:main"
+ppo-evaluate = "air_collision_avoidance.ppo_evaluate:main"
+ppo-safety-compare = "air_collision_avoidance.ppo_safety_compare:main"
+ppo-scenario-matrix = "air_collision_avoidance.ppo_scenario_matrix:main"
+ppo-sweep = "air_collision_avoidance.ppo_sweep:main"
+ppo-train = "air_collision_avoidance.ppo_train:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/air_collision_avoidance"]
+
+[[tool.uv.index]]
+name = "sres"
+url = "https://sres.web.boeing.com/artifactory/api/pypi/pypi-releases/simple"
+default = true
+authenticate = "always"

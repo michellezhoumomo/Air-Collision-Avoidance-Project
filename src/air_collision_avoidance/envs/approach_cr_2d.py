@@ -15,9 +15,12 @@ DISTANCE_MARGIN = 5         # km — radius to consider fix reached
 # Spawn geometry
 NUM_INTRUDERS = 3
 NUM_WAYPOINTS = 1
-APPROACH_DISTANCE_MIN = 30  # NM from fix — realistic final approach range
+APPROACH_DISTANCE_MIN = 30  # km from fix — realistic final approach range
 APPROACH_DISTANCE_MAX = 50
 APPROACH_CONE_DEG = 45      # aircraft spawned within +/- this angle of runway heading
+INTRUDER_BEHAVIORS = ("straight", "curved")
+INTRUDER_ROUTE_WAYPOINT_RADIUS_NM = 1.5
+INTRUDER_CURVE_MAX_OFFSET_NM = 8.0
 
 # Aircraft performance
 AC_SPD_NOMINAL = 180        # kt — typical final approach speed
@@ -34,6 +37,19 @@ SPEED_DEVIATION_PENALTY = -0.05
 PROGRESS_REWARD         =  0.1   # per km closed toward fix each step
 PROXIMITY_PENALTY       = -0.5   # max penalty inside 2x separation zone
 
+# Reward profiles keep the original baseline reproducible while allowing
+# safety-oriented alternatives to be compared as separate experiments.
+REWARD_PROFILES = {
+    "baseline": {
+        "intrusion_penalty": INTRUSION_PENALTY,
+        "proximity_penalty": PROXIMITY_PENALTY,
+    },
+    "safety_shaping": {
+        "intrusion_penalty": -5.0,
+        "proximity_penalty": -2.0,
+    },
+}
+
 ACTION_FREQUENCY = 10       # sim steps per agent action
 MAX_STEPS        = 200      # max agent steps per episode before truncation
 NM2KM = 1.852
@@ -42,13 +58,30 @@ NM2KM = 1.852
 RUNWAY_FIX_LAT = 52.3105
 RUNWAY_FIX_LON = 4.7683     # roughly Amsterdam Schiphol area as default
 
+# BlueSky owns global command/plugin registries. Re-initialising it for every
+# Gym environment produces harmless "Attempt to reimplement" warnings and can
+# overwrite singleton state, so initialize it once per Python process.
+_BLUESKY_INITIALIZED = False
+
+
+def _ensure_bluesky_initialized(dt: float) -> None:
+    """Initialize the process-wide BlueSky singleton and set the timestep."""
+    global _BLUESKY_INITIALIZED
+    if not _BLUESKY_INITIALIZED:
+        bs.init(mode="sim", detached=True)
+        _BLUESKY_INITIALIZED = True
+    bs.scr = ScreenDummy()
+    bs.stack.stack(f"DT {dt};FF")
+
 
 class ApproachCREnv2D(gym.Env):
     """
     2D Horizontal Approach Conflict Resolution Environment.
 
     Agent controls heading and speed of ownship (KL001) inbound to a runway fix.
-    Intruders fly straight-line paths toward the same fix.
+    Intruders default to straight-line paths toward the same fix. An optional
+    curved mode gives them randomized, smooth arrival paths that still end at
+    the fix for a separate robustness experiment.
     Episode ends when ownship reaches the fix or max steps exceeded.
 
     Extends the concept of HorizontalCREnv (bluesky-gym) with:
@@ -61,7 +94,10 @@ class ApproachCREnv2D(gym.Env):
     metadata = {"render_modes": ["rgb_array", "human"], "render_fps": 120}
 
     def __init__(self, render_mode=None, runway_lat=RUNWAY_FIX_LAT, runway_lon=RUNWAY_FIX_LON,
-                 action_freq=None, dt=None):
+                 action_freq=None, dt=None, reward_profile="baseline",
+                 intruder_behavior="straight",
+                 spawn_distance_min=APPROACH_DISTANCE_MIN,
+                 spawn_distance_max=APPROACH_DISTANCE_MAX):
         """
         Initialise the environment, observation/action spaces, BlueSky sim, and rendering state.
 
@@ -69,7 +105,32 @@ class ApproachCREnv2D(gym.Env):
             render_mode: 'human' for live pygame window, 'rgb_array' for headless, None for no render.
             runway_lat: Latitude of the runway fix (default: Schiphol area).
             runway_lon: Longitude of the runway fix.
+            reward_profile: ``baseline`` or ``safety_shaping``.
+            intruder_behavior: ``straight`` for the baseline or ``curved`` for
+                randomized routed intruder arrivals.
+            spawn_distance_min: Minimum aircraft spawn distance from the FAF in km.
+            spawn_distance_max: Maximum aircraft spawn distance from the FAF in km.
         """
+        if reward_profile not in REWARD_PROFILES:
+            raise ValueError(
+                f"Unknown reward_profile={reward_profile!r}; "
+                f"choose one of {sorted(REWARD_PROFILES)}"
+            )
+        if intruder_behavior not in INTRUDER_BEHAVIORS:
+            raise ValueError(
+                f"Unknown intruder_behavior={intruder_behavior!r}; "
+                f"choose one of {INTRUDER_BEHAVIORS}"
+            )
+        if spawn_distance_min <= 0 or spawn_distance_max < spawn_distance_min:
+            raise ValueError("spawn distances must satisfy 0 < min <= max")
+        self.reward_profile = reward_profile
+        self.intruder_behavior = intruder_behavior
+        self.spawn_distance_min = float(spawn_distance_min)
+        self.spawn_distance_max = float(spawn_distance_max)
+        reward_settings = REWARD_PROFILES[reward_profile]
+        self._intrusion_penalty = reward_settings["intrusion_penalty"]
+        self._proximity_penalty = reward_settings["proximity_penalty"]
+
         self.window_width = 512
         self.window_height = 512
         self.window_size = (self.window_width, self.window_height)
@@ -95,19 +156,22 @@ class ApproachCREnv2D(gym.Env):
         assert render_mode is None or render_mode in self.metadata["render_modes"]
         self.render_mode = render_mode
 
-        bs.init(mode='sim', detached=True)
-        bs.scr = ScreenDummy()
         _dt = dt if dt is not None else 5
         self._action_freq = action_freq if action_freq is not None else ACTION_FREQUENCY
         self._action_freq_max_steps = MAX_STEPS
-        bs.stack.stack(f'DT {_dt};FF')
+        _ensure_bluesky_initialized(_dt)
 
         self.total_reward = 0
         self.total_intrusions = 0
+        self.minimum_separation_nm = np.inf
         self.average_drift = np.array([])
 
         # trajectory logging for birdseye visualization
         self.trajectory = []
+        # One frame per agent decision, used by static and interactive plots.
+        self.decision_trace = []
+        self._intruder_routes = {}
+        self._intruder_route_indices = {}
 
         self.window = None
         self.clock = None
@@ -128,8 +192,12 @@ class ApproachCREnv2D(gym.Env):
         bs.traf.reset()
         self.total_reward = 0
         self.total_intrusions = 0
+        self.minimum_separation_nm = np.inf
         self.average_drift = np.array([])
         self.trajectory = []
+        self.decision_trace = []
+        self._intruder_routes = {}
+        self._intruder_route_indices = {}
         self.step_count = 0
         self.reached_fix = False
         self._prev_dist = None   # for dense progress reward
@@ -140,6 +208,7 @@ class ApproachCREnv2D(gym.Env):
 
         observation = self._get_obs()
         info = self._get_info()
+        self._log_decision(action=None, reward=0.0, info=info)
 
         if self.render_mode == "human":
             self._render_frame()
@@ -162,6 +231,7 @@ class ApproachCREnv2D(gym.Env):
         self._apply_action(action)
 
         for _ in range(self._action_freq):
+            self._guide_curved_intruders()
             bs.sim.step()
             if not self.reached_fix:   # stop logging once fix is reached
                 self._log_trajectory()
@@ -173,6 +243,7 @@ class ApproachCREnv2D(gym.Env):
         reward, terminated = self._get_reward()  # sets self.reached_fix if fix reached
         truncated = self.step_count >= self._action_freq_max_steps
         info = self._get_info()
+        self._log_decision(action=action, reward=reward, info=info)
 
         if terminated or truncated:
             for acid in bs.traf.id:
@@ -186,10 +257,10 @@ class ApproachCREnv2D(gym.Env):
 
     def _spawn_ownship(self):
         """Spawn ownship inbound to runway fix within approach cone."""
-        dist = np.random.uniform(APPROACH_DISTANCE_MIN, APPROACH_DISTANCE_MAX)
+        dist = self.np_random.uniform(self.spawn_distance_min, self.spawn_distance_max)
         # runway heading assumed 0 (north) — offset ownship behind the fix
         hdg_to_fix = 180  # ownship is south of fix, heading north
-        angle_offset = np.random.uniform(-APPROACH_CONE_DEG, APPROACH_CONE_DEG)
+        angle_offset = self.np_random.uniform(-APPROACH_CONE_DEG, APPROACH_CONE_DEG)
         spawn_hdg = hdg_to_fix + angle_offset + 180  # direction away from fix
 
         lat, lon = fn.get_point_at_distance(self.runway_lat, self.runway_lon, dist, spawn_hdg)
@@ -200,15 +271,75 @@ class ApproachCREnv2D(gym.Env):
         """Spawn intruders inbound to the same fix, spread around the cone."""
         ac_idx = bs.traf.id2idx('KL001')
         for i in range(NUM_INTRUDERS):
-            dist = np.random.uniform(APPROACH_DISTANCE_MIN, APPROACH_DISTANCE_MAX)
-            angle_offset = np.random.uniform(-APPROACH_CONE_DEG, APPROACH_CONE_DEG)
+            dist = self.np_random.uniform(self.spawn_distance_min, self.spawn_distance_max)
+            angle_offset = self.np_random.uniform(-APPROACH_CONE_DEG, APPROACH_CONE_DEG)
             hdg_to_fix = 180
             spawn_hdg = hdg_to_fix + angle_offset + 180
 
             lat, lon = fn.get_point_at_distance(self.runway_lat, self.runway_lon, dist, spawn_hdg)
-            spd = np.random.uniform(AC_SPD_MIN, AC_SPD_MAX)
+            spd = self.np_random.uniform(AC_SPD_MIN, AC_SPD_MAX)
+            route = (
+                self._build_curved_intruder_route(lat, lon)
+                if self.intruder_behavior == "curved" else []
+            )
+            initial_heading = (
+                bs.tools.geo.kwikqdrdist(lat, lon, *route[0])[0]
+                if route else hdg_to_fix + angle_offset
+            )
             bs.traf.cre(f'INT{i}', actype="A320", aclat=lat, aclon=lon,
-                        achdg=hdg_to_fix + angle_offset, acspd=spd)
+                        achdg=initial_heading, acspd=spd)
+            if route:
+                self._intruder_routes[f"INT{i}"] = route
+                self._intruder_route_indices[f"INT{i}"] = 0
+
+    def _build_curved_intruder_route(self, start_lat, start_lon):
+        """Build a randomized smooth local route ending exactly at the FAF."""
+        bearing, distance = bs.tools.geo.kwikqdrdist(
+            self.runway_lat, self.runway_lon, start_lat, start_lon
+        )
+        bearing_rad = np.deg2rad(bearing)
+        start_x = distance * np.sin(bearing_rad)
+        start_y = distance * np.cos(bearing_rad)
+        length = max(np.hypot(start_x, start_y), 1.0)
+        perpendicular = np.array((-start_y, start_x)) / length
+        bend = self.np_random.uniform(-INTRUDER_CURVE_MAX_OFFSET_NM,
+                                      INTRUDER_CURVE_MAX_OFFSET_NM)
+        wiggle = self.np_random.uniform(-2.0, 2.0)
+
+        route = []
+        for fraction in (0.25, 0.5, 0.75, 1.0):
+            base = np.array((start_x, start_y)) * (1.0 - fraction)
+            offset = bend * np.sin(np.pi * fraction) + wiggle * np.sin(2 * np.pi * fraction)
+            point = base + perpendicular * offset
+            if fraction == 1.0:
+                point = np.zeros(2)
+            point_distance = np.hypot(*point)
+            point_bearing = np.rad2deg(np.arctan2(point[0], point[1])) % 360
+            route.append(fn.get_point_at_distance(
+                self.runway_lat, self.runway_lon, point_distance, point_bearing
+            ))
+        return route
+
+    def _guide_curved_intruders(self):
+        """Turn curved intruders toward their next route point each sim tick."""
+        if self.intruder_behavior != "curved":
+            return
+        for acid, route in self._intruder_routes.items():
+            route_index = self._intruder_route_indices[acid]
+            ac_idx = bs.traf.id2idx(acid)
+            target_lat, target_lon = route[route_index]
+            bearing, distance = bs.tools.geo.kwikqdrdist(
+                bs.traf.lat[ac_idx], bs.traf.lon[ac_idx], target_lat, target_lon
+            )
+            while (distance < INTRUDER_ROUTE_WAYPOINT_RADIUS_NM
+                   and route_index < len(route) - 1):
+                route_index += 1
+                target_lat, target_lon = route[route_index]
+                bearing, distance = bs.tools.geo.kwikqdrdist(
+                    bs.traf.lat[ac_idx], bs.traf.lon[ac_idx], target_lat, target_lon
+                )
+            self._intruder_route_indices[acid] = route_index
+            bs.stack.stack(f"HDG {acid} {bearing}")
 
     def _set_waypoint(self):
         """
@@ -369,9 +500,10 @@ class ApproachCREnv2D(gym.Env):
                 bs.traf.lat[ac_idx], bs.traf.lon[ac_idx],
                 bs.traf.lat[int_idx], bs.traf.lon[int_idx]
             )
+            self.minimum_separation_nm = min(self.minimum_separation_nm, float(dis))
             if dis < INTRUSION_DISTANCE:
                 self.total_intrusions += 1
-                reward += INTRUSION_PENALTY
+                reward += self._intrusion_penalty
         return reward
 
     def _check_speed(self):
@@ -415,7 +547,7 @@ class ApproachCREnv2D(gym.Env):
                 bs.traf.lat[int_idx], bs.traf.lon[int_idx]
             )
             if dis < warn_nm:
-                reward += PROXIMITY_PENALTY * (1.0 - dis / warn_nm)
+                reward += self._proximity_penalty * (1.0 - dis / warn_nm)
         return reward
 
     def _apply_action(self, action):
@@ -453,6 +585,27 @@ class ApproachCREnv2D(gym.Env):
             }
         self.trajectory.append(step)
 
+    def _log_decision(self, action, reward, info):
+        """Log aircraft state once per agent decision for research plots."""
+        frame = {
+            "decision_step": int(self.step_count),
+            "reward": float(reward),
+            "cumulative_reward": float(info["total_reward"]),
+            "minimum_separation_nm": info["minimum_separation_nm"],
+            "total_intrusions": int(info["total_intrusions"]),
+            "sim_time_s": float(getattr(bs.sim, "simt", np.nan)),
+            "action": None if action is None else np.asarray(action, dtype=float).tolist(),
+        }
+        for acid in bs.traf.id:
+            idx = bs.traf.id2idx(acid)
+            frame[acid] = {
+                "latitude": float(bs.traf.lat[idx]),
+                "longitude": float(bs.traf.lon[idx]),
+                "heading": float(bs.traf.hdg[idx]),
+                "speed": float(bs.traf.gs[idx]),
+            }
+        self.decision_trace.append(frame)
+
     def get_trajectory_dataframes(self):
         """
         Convert logged trajectory to a dict of DataFrames keyed by aircraft ID.
@@ -485,6 +638,10 @@ class ApproachCREnv2D(gym.Env):
         return {
             "total_reward": self.total_reward,
             "total_intrusions": self.total_intrusions,
+            "reward_profile": self.reward_profile,
+            "minimum_separation_nm": (
+                None if np.isinf(self.minimum_separation_nm) else self.minimum_separation_nm
+            ),
             "average_drift": self.average_drift.mean() if len(self.average_drift) else 0.0,
             "reached_fix": self.reached_fix,
             "step": self.step_count,
