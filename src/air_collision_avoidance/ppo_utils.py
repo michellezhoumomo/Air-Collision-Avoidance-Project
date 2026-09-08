@@ -105,8 +105,13 @@ def run_episode(
     intruder_behavior: str = "straight",
     spawn_distance_min: float = APPROACH_DISTANCE_MIN,
     spawn_distance_max: float = APPROACH_DISTANCE_MAX,
+    dqn_action_map: list[tuple[float, float]] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Run one episode using PPO or a seeded random policy.
+    """Run one episode using PPO, DQN, straight-line, or a seeded random policy.
+
+    Pass ``dqn_action_map`` when evaluating a DQN model. The model predicts a
+    discrete action index which is mapped to a continuous [hdg, spd] pair before
+    being passed to the environment, matching the training wrapper exactly.
 
     Returns episode metrics and the raw trajectory captured by the environment.
     Episodes are created and closed one at a time because BlueSky is singleton.
@@ -129,6 +134,11 @@ def run_episode(
     while not (terminated or truncated):
         if model is None:
             action = env.action_space.sample()
+        elif model == "straight":
+            action = np.zeros(2, dtype=np.float64)
+        elif dqn_action_map is not None:
+            action_idx, _ = model.predict(observation, deterministic=True)
+            action = np.array(dqn_action_map[int(action_idx)], dtype=np.float64)
         else:
             action, _ = model.predict(observation, deterministic=True)
 
@@ -309,6 +319,7 @@ AIRCRAFT_COLORS = {
 }
 PLANE_GLYPH = "✈"
 FAF_RING_KM = 5.0 * 1.852
+SEP_RING_KM = 5.0 * 1.852   # 5 NM separation radius in km
 
 
 def _plane_text_angle(heading: float) -> float:
@@ -574,20 +585,41 @@ def plot_interactive_comparison(
                 })
         return annotations
 
+    ring_t = np.linspace(0, 2 * np.pi, 60)
+    ring_cos, ring_sin = np.cos(ring_t), np.sin(ring_t)
+
+    def sep_ring_trace(cx: float, cy: float, color: str, show_legend: bool, name: str):
+        return go.Scatter(
+            x=(cx + SEP_RING_KM * ring_cos).tolist(),
+            y=(cy + SEP_RING_KM * ring_sin).tolist(),
+            mode="lines",
+            name=name, legendgroup=f"sep_{name}", showlegend=show_legend,
+            line={"color": color, "width": 1, "dash": "dot"},
+            opacity=0.5,
+        )
+
     for col, (_, trace) in enumerate(episodes, start=1):
         for acid, color in AIRCRAFT_COLORS.items():
             points = frame_points(trace, acid, 0)
             if not points:
                 points = [(None, None)]
             xs, ys = zip(*points)
-            name = f"{labels[col - 1]} {acid}"
             line_style = "solid" if acid == "KL001" else "dash"
             figure.add_trace(go.Scatter(x=list(xs), y=list(ys), mode="lines",
                                         name=acid, legendgroup=acid, showlegend=(col == 1),
                                         line={"color": color, "width": 3 if acid == "KL001" else 2,
                                               "dash": line_style}), row=1, col=col)
+        # one separation ring trace per aircraft per panel (animated in frames)
+        for acid, color in AIRCRAFT_COLORS.items():
+            points = frame_points(trace, acid, 0)
+            cx, cy = points[-1] if points else (0.0, 0.0)
+            figure.add_trace(
+                sep_ring_trace(cx, cy, color, show_legend=(col == 1),
+                               name=f"{acid} 5NM"),
+                row=1, col=col,
+            )
 
-    # Static FAF markers/rings come after animated traces so frame updates align cleanly.
+    # Static FAF markers/rings
     for col in (1, 2):
         figure.add_trace(go.Scatter(x=[0], y=[0], mode="markers+text", text=["FAF"],
                                     textposition="bottom center", name="FAF", showlegend=(col == 1),
@@ -605,12 +637,21 @@ def plot_interactive_comparison(
     for frame_index in range(max_frames):
         data = []
         for _, trace in episodes:
-            for acid, color in AIRCRAFT_COLORS.items():
+            # path traces
+            for acid in AIRCRAFT_COLORS:
                 points = frame_points(trace, acid, frame_index)
                 if not points:
                     points = [(None, None)]
                 xs, ys = zip(*points)
                 data.append(go.Scatter(x=list(xs), y=list(ys)))
+            # separation ring traces — centred on current aircraft position
+            for acid, color in AIRCRAFT_COLORS.items():
+                points = frame_points(trace, acid, frame_index)
+                cx, cy = points[-1] if points else (0.0, 0.0)
+                data.append(go.Scatter(
+                    x=(cx + SEP_RING_KM * ring_cos).tolist(),
+                    y=(cy + SEP_RING_KM * ring_sin).tolist(),
+                ))
         frames.append(go.Frame(
             data=data, name=str(frame_index),
             layout={"annotations": plane_annotations(frame_index)},

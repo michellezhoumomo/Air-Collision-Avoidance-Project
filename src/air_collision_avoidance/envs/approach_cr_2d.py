@@ -15,9 +15,10 @@ DISTANCE_MARGIN = 5         # km — radius to consider fix reached
 # Spawn geometry
 NUM_INTRUDERS = 3
 NUM_WAYPOINTS = 1
-APPROACH_DISTANCE_MIN = 30  # km from fix — realistic final approach range
-APPROACH_DISTANCE_MAX = 50
-APPROACH_CONE_DEG = 45      # aircraft spawned within +/- this angle of runway heading
+APPROACH_DISTANCE_MIN = 30  # NM from fix
+APPROACH_DISTANCE_MAX = 50  # NM
+APPROACH_CONE_DEG = 45      # ownship spawned within +/- this angle of runway heading
+INTRUDER_CONE_DEG = 135     # intruders spawned across a wider arc — creates crossing traffic
 INTRUDER_BEHAVIORS = ("straight", "curved")
 INTRUDER_ROUTE_WAYPOINT_RADIUS_NM = 1.5
 INTRUDER_CURVE_MAX_OFFSET_NM = 8.0
@@ -26,32 +27,43 @@ INTRUDER_CURVE_MAX_OFFSET_NM = 8.0
 AC_SPD_NOMINAL = 180        # kt — typical final approach speed
 AC_SPD_MIN = 130
 AC_SPD_MAX = 230
-D_HEADING = 45              # max heading change per action (degrees)
+D_HEADING = 15              # max heading change per action (degrees)
 D_SPEED = 50                # max speed change per action (kt)
 
 # Reward shaping
-REACH_REWARD = 1.0
-DRIFT_PENALTY = -0.1
-INTRUSION_PENALTY = -1.0
-SPEED_DEVIATION_PENALTY = -0.05
-PROGRESS_REWARD         =  0.1   # per km closed toward fix each step
-PROXIMITY_PENALTY       = -0.5   # max penalty inside 2x separation zone
+REACH_REWARD            =  20.0
+DRIFT_PENALTY           = -0.02
+INTRUSION_PENALTY       = -0.1   # per-step, per-intruder (baseline only)
+SPEED_DEVIATION_PENALTY =  0.0   # disabled
+PROGRESS_REWARD         =  0.5   # per km closed toward fix
+PROXIMITY_PENALTY       = -0.3   # soft ramp inside 2x separation distance
 
 # Reward profiles keep the original baseline reproducible while allowing
 # safety-oriented alternatives to be compared as separate experiments.
 REWARD_PROFILES = {
     "baseline": {
         "intrusion_penalty": INTRUSION_PENALTY,
-        "proximity_penalty": PROXIMITY_PENALTY,
+        "proximity_penalty": 0.0,
     },
     "safety_shaping": {
-        "intrusion_penalty": -5.0,
-        "proximity_penalty": -2.0,
+        "intrusion_penalty": -0.5,
+        "proximity_penalty": 0.0,
+    },
+    "dqn_phase1": {
+        # Potential-based separation shaping:
+        #   - separation_scale: reward per NM of separation gained this step
+        #     (positive = moving apart is rewarded, negative = closing is penalised)
+        #   - intrusion_penalty: one-time penalty on first entry into 5 NM zone
+        #     (not per-step — avoids dominating the progress reward)
+        "intrusion_penalty": 0.0,
+        "proximity_penalty": -0.1,
+        "separation_scale":   2.0,
+        "intrusion_entry_penalty": -5.0,
     },
 }
 
 ACTION_FREQUENCY = 10       # sim steps per agent action
-MAX_STEPS        = 200      # max agent steps per episode before truncation
+MAX_STEPS        = 400      # max agent steps per episode before truncation
 NM2KM = 1.852
 
 # Runway fix — default to a placeholder; override in reset() options if needed
@@ -96,8 +108,11 @@ class ApproachCREnv2D(gym.Env):
     def __init__(self, render_mode=None, runway_lat=RUNWAY_FIX_LAT, runway_lon=RUNWAY_FIX_LON,
                  action_freq=None, dt=None, reward_profile="baseline",
                  intruder_behavior="straight",
+                 num_intruders=NUM_INTRUDERS,
                  spawn_distance_min=APPROACH_DISTANCE_MIN,
-                 spawn_distance_max=APPROACH_DISTANCE_MAX):
+                 spawn_distance_max=APPROACH_DISTANCE_MAX,
+                 intruder_distance_min=None,
+                 intruder_distance_max=None):
         """
         Initialise the environment, observation/action spaces, BlueSky sim, and rendering state.
 
@@ -108,8 +123,12 @@ class ApproachCREnv2D(gym.Env):
             reward_profile: ``baseline`` or ``safety_shaping``.
             intruder_behavior: ``straight`` for the baseline or ``curved`` for
                 randomized routed intruder arrivals.
-            spawn_distance_min: Minimum aircraft spawn distance from the FAF in km.
-            spawn_distance_max: Maximum aircraft spawn distance from the FAF in km.
+            spawn_distance_min: Minimum ownship spawn distance from the FAF in NM.
+            spawn_distance_max: Maximum ownship spawn distance from the FAF in NM.
+            intruder_distance_min: Minimum intruder spawn distance from the FAF in NM.
+                Defaults to spawn_distance_min when None.
+            intruder_distance_max: Maximum intruder spawn distance from the FAF in NM.
+                Defaults to spawn_distance_max when None.
         """
         if reward_profile not in REWARD_PROFILES:
             raise ValueError(
@@ -125,11 +144,16 @@ class ApproachCREnv2D(gym.Env):
             raise ValueError("spawn distances must satisfy 0 < min <= max")
         self.reward_profile = reward_profile
         self.intruder_behavior = intruder_behavior
+        self.num_intruders = int(num_intruders)
         self.spawn_distance_min = float(spawn_distance_min)
         self.spawn_distance_max = float(spawn_distance_max)
+        self.intruder_distance_min = float(intruder_distance_min if intruder_distance_min is not None else spawn_distance_min)
+        self.intruder_distance_max = float(intruder_distance_max if intruder_distance_max is not None else spawn_distance_max)
         reward_settings = REWARD_PROFILES[reward_profile]
         self._intrusion_penalty = reward_settings["intrusion_penalty"]
         self._proximity_penalty = reward_settings["proximity_penalty"]
+        self._separation_scale = reward_settings.get("separation_scale", 0.0)
+        self._intrusion_entry_penalty = reward_settings.get("intrusion_entry_penalty", 0.0)
 
         self.window_width = 512
         self.window_height = 512
@@ -139,15 +163,16 @@ class ApproachCREnv2D(gym.Env):
         self.runway_lon = runway_lon
 
         self.observation_space = spaces.Dict({
-            "intruder_distance":   spaces.Box(-np.inf, np.inf, shape=(NUM_INTRUDERS,), dtype=np.float64),
-            "cos_bearing":         spaces.Box(-np.inf, np.inf, shape=(NUM_INTRUDERS,), dtype=np.float64),
-            "sin_bearing":         spaces.Box(-np.inf, np.inf, shape=(NUM_INTRUDERS,), dtype=np.float64),
-            "x_difference_speed":  spaces.Box(-np.inf, np.inf, shape=(NUM_INTRUDERS,), dtype=np.float64),
-            "y_difference_speed":  spaces.Box(-np.inf, np.inf, shape=(NUM_INTRUDERS,), dtype=np.float64),
-            "waypoint_distance":   spaces.Box(-np.inf, np.inf, shape=(NUM_WAYPOINTS,), dtype=np.float64),
-            "cos_drift":           spaces.Box(-np.inf, np.inf, shape=(NUM_WAYPOINTS,), dtype=np.float64),
-            "sin_drift":           spaces.Box(-np.inf, np.inf, shape=(NUM_WAYPOINTS,), dtype=np.float64),
-            "ownship_speed":       spaces.Box(-np.inf, np.inf, shape=(1,),             dtype=np.float64),
+            "intruder_distance":      spaces.Box(-np.inf, np.inf, shape=(NUM_INTRUDERS,), dtype=np.float64),
+            "cos_bearing":            spaces.Box(-np.inf, np.inf, shape=(NUM_INTRUDERS,), dtype=np.float64),
+            "sin_bearing":            spaces.Box(-np.inf, np.inf, shape=(NUM_INTRUDERS,), dtype=np.float64),
+            "x_difference_speed":     spaces.Box(-np.inf, np.inf, shape=(NUM_INTRUDERS,), dtype=np.float64),
+            "y_difference_speed":     spaces.Box(-np.inf, np.inf, shape=(NUM_INTRUDERS,), dtype=np.float64),
+            "intruder_faf_distance":  spaces.Box(-np.inf, np.inf, shape=(NUM_INTRUDERS,), dtype=np.float64),
+            "waypoint_distance":      spaces.Box(-np.inf, np.inf, shape=(NUM_WAYPOINTS,), dtype=np.float64),
+            "cos_drift":              spaces.Box(-np.inf, np.inf, shape=(NUM_WAYPOINTS,), dtype=np.float64),
+            "sin_drift":              spaces.Box(-np.inf, np.inf, shape=(NUM_WAYPOINTS,), dtype=np.float64),
+            "ownship_speed":          spaces.Box(-np.inf, np.inf, shape=(1,),             dtype=np.float64),
         })
 
         # [heading_delta, speed_delta] both normalized to [-1, 1]
@@ -156,13 +181,14 @@ class ApproachCREnv2D(gym.Env):
         assert render_mode is None or render_mode in self.metadata["render_modes"]
         self.render_mode = render_mode
 
-        _dt = dt if dt is not None else 5
+        self._dt = dt if dt is not None else 5
         self._action_freq = action_freq if action_freq is not None else ACTION_FREQUENCY
         self._action_freq_max_steps = MAX_STEPS
-        _ensure_bluesky_initialized(_dt)
+        _ensure_bluesky_initialized(self._dt)
 
         self.total_reward = 0
         self.total_intrusions = 0
+        self.intrusion_seconds = 0.0
         self.minimum_separation_nm = np.inf
         self.average_drift = np.array([])
 
@@ -190,8 +216,10 @@ class ApproachCREnv2D(gym.Env):
         super().reset(seed=seed)
 
         bs.traf.reset()
+        bs.sim.simt = 0.0  # reset sim clock — prevents float precision drift over many episodes
         self.total_reward = 0
         self.total_intrusions = 0
+        self.intrusion_seconds = 0.0
         self.minimum_separation_nm = np.inf
         self.average_drift = np.array([])
         self.trajectory = []
@@ -200,7 +228,10 @@ class ApproachCREnv2D(gym.Env):
         self._intruder_route_indices = {}
         self.step_count = 0
         self.reached_fix = False
-        self._prev_dist = None   # for dense progress reward
+        self._prev_dist = None
+        self._prev_separation = {}
+        self._intruding = set()
+        self._intruder_at_faf = set()  # intruders that have reached the FAF — no longer a separation threat
 
         self._spawn_ownship()
         self._spawn_intruders()
@@ -240,6 +271,7 @@ class ApproachCREnv2D(gym.Env):
 
         observation = self._get_obs()
         self.step_count += 1
+        self._check_intruder_faf()
         reward, terminated = self._get_reward()  # sets self.reached_fix if fix reached
         truncated = self.step_count >= self._action_freq_max_steps
         info = self._get_info()
@@ -268,14 +300,22 @@ class ApproachCREnv2D(gym.Env):
                     achdg=hdg_to_fix + angle_offset, acspd=AC_SPD_NOMINAL)
 
     def _spawn_intruders(self):
-        """Spawn intruders inbound to the same fix, spread around the cone."""
-        ac_idx = bs.traf.id2idx('KL001')
-        for i in range(NUM_INTRUDERS):
-            dist = self.np_random.uniform(self.spawn_distance_min, self.spawn_distance_max)
-            angle_offset = self.np_random.uniform(-APPROACH_CONE_DEG, APPROACH_CONE_DEG)
+        """Spawn intruders inbound to the fix from a wide arc (INTRUDER_CONE_DEG).
+
+        Using a wider cone than the ownship means intruders approach from crossing
+        angles rather than parallel paths, creating genuine avoidable conflicts.
+        Each intruder is assigned a distinct distance band so they arrive at the
+        FAF at staggered times rather than all converging simultaneously.
+        """
+        total_range = self.intruder_distance_max - self.intruder_distance_min
+        band = total_range / max(self.num_intruders, 1)
+        for i in range(self.num_intruders):
+            band_min = self.intruder_distance_min + i * band
+            band_max = band_min + band
+            dist = self.np_random.uniform(band_min, band_max)
+            angle_offset = self.np_random.uniform(-INTRUDER_CONE_DEG, INTRUDER_CONE_DEG)
             hdg_to_fix = 180
             spawn_hdg = hdg_to_fix + angle_offset + 180
-
             lat, lon = fn.get_point_at_distance(self.runway_lat, self.runway_lon, dist, spawn_hdg)
             spd = self.np_random.uniform(AC_SPD_MIN, AC_SPD_MAX)
             route = (
@@ -371,9 +411,19 @@ class ApproachCREnv2D(gym.Env):
 
         intruder_distance, cos_bearing, sin_bearing = [], [], []
         x_diff_spd, y_diff_spd = [], []
+        intruder_faf_distance = []
 
-        for i in range(NUM_INTRUDERS):
+        for i in range(self.num_intruders):
             int_idx = bs.traf.id2idx(f'INT{i}')
+            if int_idx < 0 or f'INT{i}' in self._intruder_at_faf:
+                # intruder gone or at FAF — return safe sentinel
+                intruder_distance.append(APPROACH_DISTANCE_MAX * NM2KM)
+                cos_bearing.append(0.0)
+                sin_bearing.append(0.0)
+                x_diff_spd.append(0.0)
+                y_diff_spd.append(0.0)
+                intruder_faf_distance.append(0.0)  # already at/past FAF
+                continue
             qdr, dis = bs.tools.geo.kwikqdrdist(
                 bs.traf.lat[ac_idx], bs.traf.lon[ac_idx],
                 bs.traf.lat[int_idx], bs.traf.lon[int_idx]
@@ -387,6 +437,12 @@ class ApproachCREnv2D(gym.Env):
             hdg_diff = self.ac_hdg - bs.traf.hdg[int_idx]
             x_diff_spd.append(-np.cos(np.deg2rad(hdg_diff)) * bs.traf.gs[int_idx])
             y_diff_spd.append(self.ac_spd - np.sin(np.deg2rad(hdg_diff)) * bs.traf.gs[int_idx])
+
+            _, faf_dis = bs.tools.geo.kwikqdrdist(
+                bs.traf.lat[int_idx], bs.traf.lon[int_idx],
+                self.wpt_lat[0], self.wpt_lon[0]
+            )
+            intruder_faf_distance.append(faf_dis * NM2KM)
 
         waypoint_distance, cos_drift, sin_drift = [], [], []
         self.drift = []
@@ -404,15 +460,16 @@ class ApproachCREnv2D(gym.Env):
         self.intruder_distance = intruder_distance
 
         return {
-            "intruder_distance":  np.array(intruder_distance) / (APPROACH_DISTANCE_MAX * NM2KM),
-            "cos_bearing":        np.array(cos_bearing),
-            "sin_bearing":        np.array(sin_bearing),
-            "x_difference_speed": np.array(x_diff_spd) / AC_SPD_MAX,
-            "y_difference_speed": np.array(y_diff_spd) / AC_SPD_MAX,
-            "waypoint_distance":  np.array(waypoint_distance) / (APPROACH_DISTANCE_MAX * NM2KM),
-            "cos_drift":          np.array(cos_drift),
-            "sin_drift":          np.array(sin_drift),
-            "ownship_speed":      np.array([self.ac_spd / AC_SPD_MAX]),
+            "intruder_distance":     np.array(intruder_distance) / (APPROACH_DISTANCE_MAX * NM2KM),
+            "cos_bearing":           np.array(cos_bearing),
+            "sin_bearing":           np.array(sin_bearing),
+            "x_difference_speed":    np.array(x_diff_spd) / AC_SPD_MAX,
+            "y_difference_speed":    np.array(y_diff_spd) / AC_SPD_MAX,
+            "intruder_faf_distance": np.array(intruder_faf_distance) / (APPROACH_DISTANCE_MAX * NM2KM),
+            "waypoint_distance":     np.array(waypoint_distance) / (APPROACH_DISTANCE_MAX * NM2KM),
+            "cos_drift":             np.array(cos_drift),
+            "sin_drift":             np.array(sin_drift),
+            "ownship_speed":         np.array([self.ac_spd / AC_SPD_MAX]),
         }
 
     # ------------------------------------------------------------------
@@ -484,26 +541,49 @@ class ApproachCREnv2D(gym.Env):
 
     def _check_intrusion(self):
         """
-        Check for separation violations between ownship and each intruder.
+        Potential-based separation reward for dqn_phase1; binary penalty for other profiles.
 
-        Increments total_intrusions and applies INTRUSION_PENALTY for every
-        intruder closer than INTRUSION_DISTANCE NM.
+        dqn_phase1: rewards increasing separation and penalises decreasing it, scaled
+        by separation_scale. A one-time entry penalty fires when the ownship first
+        crosses into the 5 NM zone for each intruder. This decouples the avoidance
+        signal from the navigation signal — the agent is rewarded for the direction
+        of movement relative to each intruder, not just for being outside a threshold.
 
-        Returns:
-            reward (float): Sum of intrusion penalties earned this step.
+        Other profiles: per-step penalty whenever inside INTRUSION_DISTANCE.
         """
         ac_idx = bs.traf.id2idx('KL001')
-        reward = 0
-        for i in range(NUM_INTRUDERS):
-            int_idx = bs.traf.id2idx(f'INT{i}')
+        reward = 0.0
+        for i in range(self.num_intruders):
+            acid = f'INT{i}'
+            int_idx = bs.traf.id2idx(acid)
+            if int_idx < 0 or acid in self._intruder_at_faf:
+                self._prev_separation.pop(acid, None)
+                self._intruding.discard(acid)
+                continue
             _, dis = bs.tools.geo.kwikqdrdist(
                 bs.traf.lat[ac_idx], bs.traf.lon[ac_idx],
                 bs.traf.lat[int_idx], bs.traf.lon[int_idx]
             )
             self.minimum_separation_nm = min(self.minimum_separation_nm, float(dis))
-            if dis < INTRUSION_DISTANCE:
-                self.total_intrusions += 1
-                reward += self._intrusion_penalty
+
+            if self._separation_scale != 0.0:
+                # potential-based: reward delta separation, clipped to avoid large spikes
+                prev = self._prev_separation.get(acid, dis)
+                delta = np.clip(dis - prev, -2.0, 2.0)   # NM change this step
+                reward += self._separation_scale * delta
+                self._prev_separation[acid] = dis
+                # accumulate intrusion-seconds regardless of whether this is a new entry
+                if dis < INTRUSION_DISTANCE:
+                    self.intrusion_seconds += self._action_freq * self._dt
+                    if acid not in self._intruding:
+                        reward += self._intrusion_entry_penalty
+                        self._intruding.add(acid)
+                        self.total_intrusions += 1
+            else:
+                # baseline / safety_shaping: per-step binary penalty
+                if dis < INTRUSION_DISTANCE:
+                    self.total_intrusions += 1
+                    reward += self._intrusion_penalty
         return reward
 
     def _check_speed(self):
@@ -519,6 +599,29 @@ class ApproachCREnv2D(gym.Env):
     # ------------------------------------------------------------------
     # Action
     # ------------------------------------------------------------------
+
+    def _check_intruder_faf(self):
+        """Once an intruder enters the FAF radius, fly it straight through on its current heading."""
+        for i in range(self.num_intruders):
+            acid = f'INT{i}'
+            if acid in self._intruder_at_faf:
+                continue
+            int_idx = bs.traf.id2idx(acid)
+            if int_idx < 0:
+                continue
+            _, dis = bs.tools.geo.kwikqdrdist(
+                bs.traf.lat[int_idx], bs.traf.lon[int_idx],
+                self.wpt_lat[0], self.wpt_lon[0]
+            )
+            if dis * NM2KM < DISTANCE_MARGIN:
+                self._intruder_at_faf.add(acid)
+                self._prev_separation.pop(acid, None)
+                self._intruding.discard(acid)
+                # remove from curved routing so _guide_curved_intruders stops turning it
+                self._intruder_routes.pop(acid, None)
+                self._intruder_route_indices.pop(acid, None)
+                # lock in current heading so it flies straight through and clears the zone
+                bs.stack.stack(f"HDG {acid} {bs.traf.hdg[int_idx]}")
 
     def _check_progress(self):
         """Dense reward: +PROGRESS_REWARD per km closed toward fix this step."""
@@ -540,8 +643,11 @@ class ApproachCREnv2D(gym.Env):
         ac_idx = bs.traf.id2idx('KL001')
         reward = 0.0
         warn_nm = INTRUSION_DISTANCE * 2
-        for i in range(NUM_INTRUDERS):
-            int_idx = bs.traf.id2idx(f'INT{i}')
+        for i in range(self.num_intruders):
+            acid = f'INT{i}'
+            int_idx = bs.traf.id2idx(acid)
+            if int_idx < 0 or acid in self._intruder_at_faf:
+                continue
             _, dis = bs.tools.geo.kwikqdrdist(
                 bs.traf.lat[ac_idx], bs.traf.lon[ac_idx],
                 bs.traf.lat[int_idx], bs.traf.lon[int_idx]
@@ -638,6 +744,7 @@ class ApproachCREnv2D(gym.Env):
         return {
             "total_reward": self.total_reward,
             "total_intrusions": self.total_intrusions,
+            "intrusion_seconds": self.intrusion_seconds,
             "reward_profile": self.reward_profile,
             "minimum_separation_nm": (
                 None if np.isinf(self.minimum_separation_nm) else self.minimum_separation_nm
@@ -672,8 +779,10 @@ class ApproachCREnv2D(gym.Env):
         ac_idx = bs.traf.id2idx('KL001')
         self._draw_aircraft(canvas, ac_idx, max_distance, size=8, color=(0, 0, 0))
 
-        for i in range(NUM_INTRUDERS):
+        for i in range(self.num_intruders):
             int_idx = bs.traf.id2idx(f'INT{i}')
+            if int_idx < 0:
+                continue
             qdr, dis = bs.tools.geo.kwikqdrdist(
                 bs.traf.lat[ac_idx], bs.traf.lon[ac_idx],
                 bs.traf.lat[int_idx], bs.traf.lon[int_idx]
